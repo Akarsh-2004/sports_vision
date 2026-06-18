@@ -1,0 +1,20 @@
+# Minimal deps for pipeline + highlights (no torch — use system torch if installed)
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+python-multipart>=0.0.12
+pydantic>=2.9.0
+pydantic-settings>=2.6.0
+pyyaml>=6.0.2
+numpy>=1.26.0
+opencv-python-headless>=4.10.0
+scipy>=1.14.0
+scikit-learn>=1.5.0
+filterpy>=1.4.5
+matplotlib>=3.9.0
+plotly>=5.24.0
+pillow>=10.4.0
+httpx>=0.27.0
+aiofiles>=24.1.0
+imageio-ffmpeg>=0.5.1
+mediapipe>=0.10.14
+pytest>=8.3.0

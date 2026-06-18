@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+.pytest_cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Large media (keep locally, not in git)
+*.mp4
+*.avi
+*.mov
+*.webm
+*.mkv
+*.exe
+
+# Generated outputs
+output_*/
+output_padel_sample/
+
+# Tennis analysis artifacts
+tennis-analysis/data/raw/*
+tennis-analysis/data/processed/*
+tennis-analysis/data/reports/*
+!tennis-analysis/data/raw/.gitkeep
+!tennis-analysis/data/processed/.gitkeep
+!tennis-analysis/data/reports/.gitkeep
+tennis-analysis/frontend/node_modules/
+tennis-analysis/frontend/dist/
+
+# Padel analysis artifacts
+padel-analysis/data/raw/*
+padel-analysis/data/processed/*
+padel-analysis/data/reports/*
+!padel-analysis/data/raw/.gitkeep
+!padel-analysis/data/processed/.gitkeep
+!padel-analysis/data/reports/.gitkeep
+
+# Model weights (download separately)
+**/weights/*.pt
+**/weights/*.onnx
+yolo*.pt
+
+# HTML design drafts at root
+tennis_match_analysis_system_design.html
+tennis_pipeline_refinement_strategy.html

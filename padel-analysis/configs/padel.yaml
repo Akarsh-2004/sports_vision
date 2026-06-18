@@ -1,0 +1,119 @@
+pipeline:
+  target_fps: 25
+  target_width: 1280
+  target_height: 720
+  stabilize: false
+  court_gate: false
+  pose_keyframe_interval: 3
+  pose_on_ball_contact_only: true
+  detection_stride: 4
+
+models:
+  player_detector: yolo11n.pt
+  player_tracker: botsort.yaml
+  person_conf: 0.35
+  max_players: 4
+  temporal_smooth_frames: 3
+  use_onnx: false
+  ball_detector: heuristic  # yolo | heuristic
+  pose: mediapipe  # rtmpose | vitpose | mediapipe
+  stroke_model: heuristic  # videomae | slowfast | heuristic
+  device: auto
+
+phone:
+  enabled: true
+  auto_enable: true
+  denoise: true
+
+court:
+  recompute_interval: 30
+  court_length_m: 20.0
+  court_width_m: 10.0
+  wall_offset_m: 3.0
+  use_manual_calibration: false
+  landmark_count: 13
+
+active_play:
+  enabled: true
+  ignore_audience_closeup: true
+  closeup_bbox_area_ratio: 0.28
+  min_players_on_court: 2
+  min_ball_speed_kmh: 4.0
+  min_ball_conf: 0.18
+  min_player_motion_mps: 0.9
+  dead_time_ball_idle_s: 2.5
+  ball_activity_tail_s: 1.2
+  audio_hit_window_s: 1.0
+  min_active_segment_s: 1.5
+  merge_gap_s: 2.0
+
+strokes:
+  min_shot_gap_s: 0.55
+  global_shot_gap_s: 0.22
+  contact_max_dist_px: 120
+
+rally:
+  min_duration_s: 2.0
+  min_bounces: 1
+  min_shots: 2
+  ball_stationary_s: 1.2
+
+ball:
+  bounce_speed_drop: 0.35
+  wall_direction_change_deg: 45
+  kalman_max_miss_frames: 5
+
+audio:
+  rally_hints: true
+
+analytics:
+  sprint_threshold_mps: 3.2
+  sprint_min_duration_s: 0.4
+  net_approach_distance_m: 2.5
+  recovery_centroid_radius_m: 1.2
+  partner_spacing_ideal_m: 3.0
+
+events:
+  long_rally_shots: 10
+  wall_exchange_min: 2
+
+highlights:
+  top_k: 12
+  preroll_frames: 75
+  postroll_frames: 60
+  min_excitement: 40
+  merge_overlap_s: 2.0
+  weights: [0.15, 0.25, 0.2, 0.15, 0.25]  # length, speed, walls, shots, movement
+
+coach_highlights:
+  enabled: true
+  shot_preroll_s: 3
+  shot_postroll_s: 3
+  rally_preroll_s: 2
+  rally_postroll_s: 3
+  max_per_category: 8
+  top_moments: 10
+
+summarization:
+  provider: template  # ollama | api
+  ollama_url: http://localhost:11434
+  ollama_model: qwen2.5:7b
+  temperature: 0.3
+
+selection:
+  mode: single  # single | pair | all
+  auto_pick_near_side: true
+
+intelligence:
+  enabled: true
+
+paths:
+  data_raw: data/raw
+  data_processed: data/processed
+  data_reports: data/reports
+  weights: weights
+
+api:
+  host: 0.0.0.0
+  port: 8001
+  max_upload_mb: 2048

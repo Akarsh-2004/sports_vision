@@ -37,7 +37,10 @@ class IntelligencePipeline:
         self.pattern_miner = PatternMiner()
         self.opponent_profiler = OpponentProfiler()
         self.explainer = ExplainabilityEngine()
-        self.rally_builder = RallyGraphBuilder(self.fps)
+        self.rally_builder = RallyGraphBuilder(
+            self.fps,
+            min_shots=config.get("rally", {}).get("min_shots", 2),
+        )
         db_path = Path(config["paths"]["data_reports"]) / "padel_learning.db"
         self.learning_db = LearningDatabase(db_path)
 
@@ -70,6 +73,7 @@ class IntelligencePipeline:
                 "match_id": match_id,
                 "duration_s": duration_s,
                 "target_player": self.target_id,
+                "points_detected": len(analytics_rallies or []),
                 "patterns": patterns,
                 "opponents": opponents,
                 "self_evaluation": self_eval,
@@ -77,9 +81,15 @@ class IntelligencePipeline:
         )
         knowledge_pkg["recommendations"] = recommendations
         knowledge_pkg["rally_graphs"] = rally_exports
+        knowledge_pkg["interaction_graph"] = [n.to_dict() for n in world.all_interactions]
 
         intelligence_report = self.reasoner.reason(knowledge_pkg)
-        reports = self.reporter.generate_all(knowledge_pkg, intelligence_report)
+        reports = self.reporter.generate_all(
+            knowledge_pkg,
+            intelligence_report,
+            all_player_ids=all_player_ids,
+            fps=self.fps,
+        )
 
         self.learning_db.save_match(world, match_id, source_video, duration_s, shots, rally_exports)
         self.learning_db.save_player_session(self.target_id, match_id, shots, tactical.to_dict())

@@ -7,9 +7,14 @@ from backend.utils.types import EventType, MatchEvent, RallySegment, ShotQuality
 
 class EventDetector:
     def __init__(self, config: dict):
+        self.fps = config["pipeline"]["target_fps"]
         self.net_distance = config["analytics"]["net_approach_distance_m"]
         self.long_rally_shots = config.get("events", {}).get("long_rally_shots", 10)
         self.wall_exchange_min = config.get("events", {}).get("wall_exchange_min", 2)
+        gap_s = config.get("events", {}).get("net_approach_min_gap_s", 3.0)
+        self.net_approach_gap_frames = max(1, int(gap_s * self.fps))
+        self._last_net_approach: dict[int, int] = {}
+        self._player_at_net: dict[int, bool] = {}
         self.events: list[MatchEvent] = []
 
     def detect_from_rally(
@@ -73,17 +78,39 @@ class EventDetector:
         self.events.extend(found)
         return found
 
-    def detect_net_approach(self, frame_idx: int, court_y: float, track_id: int, court_length: float) -> MatchEvent | None:
+    def detect_net_approach(
+        self,
+        frame_idx: int,
+        court_y: float,
+        track_id: int,
+        court_length: float,
+    ) -> MatchEvent | None:
+        """
+        Edge-triggered net approach: fire once when player enters net zone,
+        suppress until they leave and return (plus cooldown).
+        """
         net_y = court_length / 2
-        if abs(court_y - net_y) < self.net_distance:
-            ev = MatchEvent(
-                frame_idx=frame_idx,
-                event_type=EventType.NET_APPROACH,
-                player_track_id=track_id,
-            )
-            self.events.append(ev)
-            return ev
-        return None
+        at_net = abs(court_y - net_y) < self.net_distance
+        was_at_net = self._player_at_net.get(track_id, False)
+        self._player_at_net[track_id] = at_net
+
+        if not at_net:
+            return None
+        if was_at_net:
+            return None
+
+        last = self._last_net_approach.get(track_id, -10_000)
+        if frame_idx - last < self.net_approach_gap_frames:
+            return None
+
+        self._last_net_approach[track_id] = frame_idx
+        ev = MatchEvent(
+            frame_idx=frame_idx,
+            event_type=EventType.NET_APPROACH,
+            player_track_id=track_id,
+        )
+        self.events.append(ev)
+        return ev
 
     def detect_smash_winner(self, frame_idx: int, stroke_type: StrokeType, in_court: bool, track_id: int) -> None:
         if stroke_type == StrokeType.SMASH and in_court:

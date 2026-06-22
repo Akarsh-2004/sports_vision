@@ -14,10 +14,12 @@ class RallyGraphBuilder:
     Player → Ball → Wall → Player → Net → Ground
     """
 
-    def __init__(self, fps: float, gap_s: float = 2.0, hit_gap_s: float = 0.5):
+    def __init__(self, fps: float, gap_s: float = 2.0, hit_gap_s: float = 0.5, min_shots: int = 2):
         self.fps = fps
         self.gap_frames = int(gap_s * fps)
         self.hit_gap_frames = max(1, int(hit_gap_s * fps))
+        self.min_rally_frames = max(1, int(1.0 * fps))
+        self.min_shots = min_shots
 
     def dedupe_hits(self, interactions: list[InteractionNode]) -> list[InteractionNode]:
         """Collapse consecutive same-player hits within one swing window."""
@@ -87,8 +89,13 @@ class RallyGraphBuilder:
 
         segments = self.segment_rallies(interactions)
         for i, (start, end) in enumerate(segments):
+            if end - start < self.min_rally_frames:
+                continue
             nodes = [n for n in interactions if start <= n.frame_idx <= end]
             nodes.sort(key=lambda n: n.frame_idx)
+            hit_count = sum(1 for n in nodes if n.interaction_type.value == "player_hit")
+            if hit_count < self.min_shots:
+                continue
             graphs.append(RallyGraph(rally_id=i, start_frame=start, end_frame=end, nodes=nodes))
 
         return graphs

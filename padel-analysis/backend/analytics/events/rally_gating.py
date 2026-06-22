@@ -47,3 +47,40 @@ def walking_to_baseline(
         if 0.25 < speed < 2.8:
             return True
     return False
+
+
+def detect_baseline_reset(
+    prev_players: dict[int, tuple[float, float]],
+    curr_players: dict[int, tuple[float, float]],
+    court_length_m: float,
+    fps: float = 25.0,
+) -> bool:
+    """
+    After a rally, players retreat toward their baselines (both halves moving apart).
+    """
+    if len(prev_players) < 2 or len(curr_players) < 2:
+        return False
+
+    net_y = court_length_m / 2.0
+    retreat_top = 0
+    retreat_bottom = 0
+    count_top = 0
+    count_bottom = 0
+
+    for pid, (cx, cy) in curr_players.items():
+        prev = prev_players.get(pid)
+        if not prev:
+            continue
+        dy = (cy - prev[1]) * fps
+        if cy < net_y:
+            count_top += 1
+            if dy < -0.2:
+                retreat_top += 1
+        else:
+            count_bottom += 1
+            if dy > 0.2:
+                retreat_bottom += 1
+
+    if count_top == 0 or count_bottom == 0:
+        return False
+    return retreat_top >= max(1, count_top // 2) and retreat_bottom >= max(1, count_bottom // 2)

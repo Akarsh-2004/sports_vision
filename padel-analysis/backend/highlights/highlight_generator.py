@@ -14,7 +14,7 @@ logger = get_logger(__name__)
 class HighlightGenerator:
     """Stage 14: excitement-scored clips with dedup merge pass."""
 
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, output_dir: Path | None = None):
         hcfg = config["highlights"]
         self.top_k = hcfg["top_k"]
         self.preroll = hcfg["preroll_frames"]
@@ -22,7 +22,11 @@ class HighlightGenerator:
         self.min_excitement = hcfg.get("min_excitement", 45.0)
         self.merge_overlap_s = hcfg.get("merge_overlap_s", 2.0)
         self.fps = config["pipeline"]["target_fps"]
-        self.output_dir = Path(config["paths"]["data_reports"]) / "highlights"
+        default = Path(config["paths"]["data_reports"]) / "highlights"
+        self.output_dir = output_dir or default
+
+    def set_output_dir(self, path: Path) -> None:
+        self.output_dir = path
 
     def _excitement_raw(
         self,

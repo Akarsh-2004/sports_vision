@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -12,7 +13,20 @@ logger = get_logger(__name__)
 
 
 class BallDetector:
-    """Stage 6: heuristic + motion-streak detection for fast balls."""
+    """
+    Stage 6: Padel ball detection.
+
+    Modes (set via config['models']['ball_detector']):
+      - 'yolo'      → fine-tuned YOLOv11n on padel ball dataset (recommended)
+      - 'heuristic' → color mask + motion streak (fallback, no weights needed)
+
+    With 'yolo' mode:
+      - Loads weights from config['models']['ball_yolo_weights']
+        (default: weights/padel_ball_yolo11n.pt)
+      - Falls back to heuristic if weights not found
+      - YOLO confidence is passed directly to the Kalman tracker
+      - Fuses YOLO detection with motion streak for extra robustness on fast balls
+    """
 
     def __init__(self, config: dict):
         self.mode = config["models"].get("ball_detector", "heuristic")
@@ -21,15 +35,89 @@ class BallDetector:
         self.model = None
         self.bounce_threshold = config.get("ball", {}).get("bounce_speed_drop", 0.4)
         self._prev_speed = 0.0
-        if self.mode == "tracknet":
-            self._try_load_tracknet()
+        self._device = self._resolve_device(config.get("models", {}).get("device", "auto"))
 
-    def _try_load_tracknet(self) -> None:
-        logger.info("TrackNet weights not bundled; using heuristic + streak detection")
-        self.mode = "heuristic"
+        # Weight path resolution
+        self._weights_path: str | None = None
+        if self.mode == "yolo":
+            raw = config.get("models", {}).get(
+                "ball_yolo_weights", "weights/padel_ball_yolo11n.pt"
+            )
+            # Support both absolute and relative-to-project paths
+            p = Path(raw)
+            if not p.is_absolute():
+                # Try relative to the project root (parent of scripts/)
+                project_root = Path(__file__).resolve().parents[2]
+                p = project_root / raw
+            if p.exists():
+                self._weights_path = str(p)
+                self._load_yolo(self._weights_path)
+            else:
+                logger.warning(
+                    "Ball YOLO weights not found at '%s'. "
+                    "Run: python scripts/train_ball_detector.py\n"
+                    "Falling back to heuristic detector.",
+                    p,
+                )
+                self.mode = "heuristic"
+
+    # ── device resolution ─────────────────────────────────────────────────────
+
+    def _resolve_device(self, device: str) -> str:
+        if device != "auto":
+            return device
+        try:
+            import torch
+
+            if torch.backends.mps.is_available():
+                return "mps"
+            if torch.cuda.is_available():
+                return "cuda"
+        except ImportError:
+            pass
+        return "cpu"
+
+    # ── model loading ─────────────────────────────────────────────────────────
+
+    def _load_yolo(self, weights: str) -> None:
+        try:
+            from ultralytics import YOLO
+
+            self.model = YOLO(weights)
+            logger.info(
+                "Ball YOLO loaded: %s  device=%s", Path(weights).name, self._device
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to load ball YOLO (%s). Falling back to heuristic.", exc
+            )
+            self.model = None
+            self.mode = "heuristic"
+
+    # ── public API ────────────────────────────────────────────────────────────
 
     def detect(self, frame: np.ndarray) -> BallDetection:
         self.frame_buffer.append(frame.copy())
+
+        if self.mode == "yolo" and self.model is not None:
+            det = self._detect_yolo(frame)
+            # Fuse with motion streak for extra robustness on very fast balls
+            if not det.visible or det.confidence < 0.35:
+                streak = self._detect_motion_streak(frame)
+                if streak.visible and streak.confidence > det.confidence:
+                    # Blend positions weighted by confidence
+                    if det.visible:
+                        w1 = det.confidence
+                        w2 = streak.confidence * 0.7  # down-weight heuristic
+                        total = w1 + w2
+                        blended_x = (det.x * w1 + streak.x * w2) / total
+                        blended_y = (det.y * w1 + streak.y * w2) / total
+                        blended_c = max(det.confidence, streak.confidence * 0.7)
+                        return BallDetection(blended_x, blended_y, blended_c, True)
+                    return streak
+            return det
+
+        # Heuristic path
         det = self._detect_heuristic(frame)
         if not det.visible:
             streak = self._detect_motion_streak(frame)
@@ -41,6 +129,54 @@ class BallDetector:
         bounced = self._prev_speed > 5.0 and speed < self._prev_speed * self.bounce_threshold
         self._prev_speed = speed
         return bounced
+
+    # ── YOLO inference ────────────────────────────────────────────────────────
+
+    def _detect_yolo(self, frame: np.ndarray) -> BallDetection:
+        """Run YOLOv11n inference and return highest-confidence ball detection."""
+        try:
+            results = self.model.predict(
+                frame,
+                conf=0.20,          # Low threshold — Kalman will handle noise
+                iou=0.4,
+                imgsz=640,
+                verbose=False,
+                device=self._device,
+                classes=[0],        # 'sports ball' class (dataset has nc=1)
+                max_det=5,
+            )
+        except Exception as exc:
+            logger.debug("YOLO ball inference error: %s", exc)
+            return BallDetection(0, 0, 0.0, False)
+
+        best_conf = 0.0
+        best_det = BallDetection(0, 0, 0.0, False)
+
+        for r in results:
+            if r.boxes is None or len(r.boxes) == 0:
+                continue
+            for box in r.boxes:
+                conf = float(box.conf[0])
+                if conf <= best_conf:
+                    continue
+                x1, y1, x2, y2 = box.xyxy[0].tolist()
+                cx = (x1 + x2) / 2
+                cy = (y1 + y2) / 2
+                w = x2 - x1
+                h = y2 - y1
+                # Sanity: padel ball is small — reject huge boxes
+                frame_h, frame_w = frame.shape[:2]
+                if w > frame_w * 0.12 or h > frame_h * 0.12:
+                    continue
+                # Reject tiny detections below 3px (noise)
+                if w < 3 or h < 3:
+                    continue
+                best_conf = conf
+                best_det = BallDetection(cx, cy, conf, True)
+
+        return best_det
+
+    # ── heuristic detectors ───────────────────────────────────────────────────
 
     def _detect_motion_streak(self, frame: np.ndarray) -> BallDetection:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)

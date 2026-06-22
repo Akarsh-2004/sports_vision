@@ -79,11 +79,14 @@ def generate(match_dir: Path, video_path: Path | None = None) -> Path:
     net_pct = tactical.get("net_dominance_pct", movement.get("net_zone_pct", 0) * 100)
     stroke_dist = stats.get("stroke_distribution", {})
 
+    points_detected = len(data.get("rallies_all", []))
+
     payload = json.dumps(
         {
             "match_id": match_id,
             "fps": fps,
             "overall": overall,
+            "points_detected": points_detected,
             "manifest": manifest,
             "category_labels": category_labels,
             "timeline": timeline[:120],
@@ -182,7 +185,7 @@ img.chart {{ max-width: 100%; border-radius: 8px; }}
         <div class="card">
           <h3>Today's Match Score</h3>
           <div class="score-ring" id="coach-score">{overall:.0f}</div>
-          <div>⭐⭐⭐⭐☆ · Active play {active.get('active_ratio', 0)*100:.0f}%</div>
+          <div>⭐⭐⭐⭐☆ · Active play {active.get('active_ratio', 0)*100:.0f}% · Points {len(data.get('rallies_all', []))}</div>
         </div>
         <div class="card">
           <h3>Module Confidence</h3>
@@ -306,12 +309,23 @@ const DATA = {payload};
 function $(id) {{ return document.getElementById(id); }}
 function esc(s) {{ const d=document.createElement('div'); d.textContent=s; return d.innerHTML; }}
 
+function clipUrl(h) {{
+  if (!h.clip_path) return null;
+  const p = String(h.clip_path).replace(/^highlights[/\\\\]/, '');
+  return 'highlights/' + p;
+}}
+
 function playHighlight(h, useHlPlayer=false) {{
   const v = useHlPlayer ? $('hl-player') : $('player');
-  if (!DATA.video) return;
-  v.src = DATA.video;
-  v.currentTime = Math.max(0, (h.start_frame || 0) / DATA.fps);
-  v.play();
+  const hp = clipUrl(h);
+  if (hp && useHlPlayer) {{
+    $('hl-player').src = hp;
+    $('hl-player').play();
+  }} else if (DATA.video) {{
+    v.src = DATA.video;
+    v.currentTime = Math.max(0, (h.start_frame || 0) / DATA.fps);
+    v.play();
+  }}
   $('copilot-commentary').textContent = h.commentary || 'Replay this moment for tactical review.';
   const ov = h.overlay || {{}};
   $('live-overlay').innerHTML = `
@@ -322,10 +336,6 @@ function playHighlight(h, useHlPlayer=false) {{
   $('copilot-rally').textContent = 'Rally: ' + (h.rally_length ? h.rally_length + ' shots' : h.level || 'moment');
   $('copilot-pressure').textContent = 'Pressure: ' + (ov.pressure || 'medium');
   $('copilot-winner').textContent = 'Excitement: ' + (h.excitement || '—') + '/100';
-  if (h.clip_path) {{
-    const hp = 'highlights/' + h.clip_path.split('/').slice(-2).join('/');
-    if (useHlPlayer) {{ $('hl-player').src = hp; $('hl-player').play(); }}
-  }}
   document.querySelector('[data-panel="replay"]')?.click?.();
   switchPanel('replay');
 }}

@@ -15,10 +15,15 @@ models:
   max_players: 4
   temporal_smooth_frames: 3
   use_onnx: false
-  ball_detector: heuristic  # yolo | heuristic
-  pose: mediapipe  # rtmpose | vitpose | mediapipe
-  stroke_model: heuristic  # videomae | slowfast | heuristic
-  device: auto
+  # Ball detector: 'yolo' uses fine-tuned padel ball model (recommended after training)
+  # Switch to 'heuristic' if weights not yet trained
+  ball_detector: yolo                          # yolo | heuristic
+  ball_yolo_weights: weights/padel_ball_yolo11n.pt
+  ball_yolo_conf: 0.20                         # low conf — Kalman handles noise
+  # Court keypoints: 'true' uses fine-tuned YOLOv8-pose model
+  pose: mediapipe                              # rtmpose | vitpose | mediapipe
+  stroke_model: heuristic                      # videomae | slowfast | heuristic
+  device: mps                                 # auto | mps | cuda | cpu
 
 phone:
   enabled: true
@@ -31,6 +36,9 @@ court:
   court_width_m: 10.0
   wall_offset_m: 3.0
   use_manual_calibration: false
+  use_yolo_court: true
+  yolo_court_weights: weights/padel_court_keypoints.pt  # after training court model
+  yolo_court_conf: 0.25
   landmark_count: 13
 
 active_play:
@@ -48,23 +56,31 @@ active_play:
   merge_gap_s: 2.0
 
 strokes:
-  min_shot_gap_s: 0.55
-  global_shot_gap_s: 0.22
+  min_shot_gap_s: 0.50
+  global_shot_gap_s: 0.50
   contact_max_dist_px: 120
 
 rally:
-  min_duration_s: 2.0
+  min_duration_s: 1.5
   min_bounces: 1
   min_shots: 2
   ball_stationary_s: 1.2
+  point_gap_s: 3.5           # shot-cluster gap fallback (~3 points on phone clips)
+  point_min_shots: 2
+  min_active_point_s: 4.0    # drop active-play tails shorter than this
+  min_active_point_shots: 2   # min debounced hits to count as a point
+  fsm_min_dwell_s: 1.5
+  point_end_post_window_s: 2.0
+  point_end_ball_lost_s: 3.0
 
 ball:
   bounce_speed_drop: 0.35
   wall_direction_change_deg: 45
   kalman_max_miss_frames: 5
+  max_speed_kmh: 120         # clamp Kalman noise before highlights/reports
 
 audio:
-  rally_hints: true
+  rally_hints: false
 
 analytics:
   sprint_threshold_mps: 3.2
@@ -76,6 +92,7 @@ analytics:
 events:
   long_rally_shots: 10
   wall_exchange_min: 2
+  net_approach_min_gap_s: 3.0   # cooldown after edge-triggered approach (~90 frames at 30fps)
 
 highlights:
   top_k: 12
@@ -89,10 +106,23 @@ coach_highlights:
   enabled: true
   shot_preroll_s: 3
   shot_postroll_s: 3
-  rally_preroll_s: 2
-  rally_postroll_s: 3
+  rally_preroll_s: 1
+  rally_postroll_s: 1.5
+  max_rally_highlight_s: 35
   max_per_category: 8
+  category_caps:              # tighter caps for spam-prone categories
+    net_battle: 2
+    best_defense: 4
   top_moments: 10
+  # Annotated video export settings
+  annotate_clips: true              # draw overlays on highlight clips
+  annotation_style: broadcast       # broadcast | minimal
+  ball_trail_frames: 12             # how many past ball positions to draw
+  show_mini_court: true             # top-down court diagram
+  show_speed_meter: true            # ball speed gauge
+  show_excitement_bar: true         # excitement level indicator
+  show_player_ids: true             # player bounding boxes + team color labels
+  annotation_output_suffix: _annotated  # annotated clips get this suffix
 
 summarization:
   provider: template  # ollama | api

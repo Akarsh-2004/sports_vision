@@ -11,9 +11,18 @@ from typing import Any
 
 from backend.utils.ffmpeg import get_ffmpeg
 from backend.utils.logging import get_logger
+from backend.utils.speed import peak_speed_in_range
 from backend.utils.types import EventType, MatchEvent, RallySegment
 
 logger = get_logger(__name__)
+
+# Lazy import to avoid circular deps
+def _get_annotated_exporter():
+    try:
+        from backend.visualization.annotated_exporter import AnnotatedExporter, FrameAnnotation
+        return AnnotatedExporter, FrameAnnotation
+    except Exception:
+        return None, None
 
 
 class HighlightLevel(str, Enum):
@@ -85,7 +94,7 @@ def _stroke_category(stroke: str) -> str | None:
     if s in ("lob", "salida"):
         return "best_defense"
     if s == "drop_shot":
-        return "best_defense"
+        return None
     return None
 
 
@@ -101,12 +110,21 @@ class CoachHighlightEngine:
         self.shot_postroll = int(hcfg.get("shot_postroll_s", 3) * self.fps)
         self.rally_preroll = int(hcfg.get("rally_preroll_s", 2) * self.fps)
         self.rally_postroll = int(hcfg.get("rally_postroll_s", 3) * self.fps)
+        self.max_rally_highlight_s = hcfg.get("max_rally_highlight_s", 35.0)
+        self.max_rally_highlight_frames = int(self.max_rally_highlight_s * self.fps)
         self.max_per_category = hcfg.get("max_per_category", 8)
+        self.category_caps: dict[str, int] = hcfg.get("category_caps", {})
         self.top_moments = hcfg.get("top_moments", 10)
         self.enabled = hcfg.get("enabled", True)
         self.min_excitement = legacy.get("min_excitement", 40.0)
         self.output_dir = match_dir / "highlights"
         self._next_id = 1
+        # Annotated export
+        self.annotate = hcfg.get("annotate_clips", True)
+        self._ann_suffix = hcfg.get("annotation_output_suffix", "_annotated")
+        # Frame data set by orchestrator before calling generate()
+        self.frame_annotations: dict = {}
+        self.ball_speeds_by_frame: dict[int, float] = {}
 
     def generate(
         self,
@@ -117,9 +135,41 @@ class CoachHighlightEngine:
         intelligence: dict[str, Any],
         max_ball_speed: float,
         target_id: int | None,
+        ball_speeds_by_frame: dict[int, float] | None = None,
     ) -> dict[str, Any]:
         if not self.enabled:
-            return {"manifest": [], "by_category": {}, "paths": []}
+            return {"manifest": [], "by_category": {}, "paths": [], "events": []}
+        self.ball_speeds_by_frame = ball_speeds_by_frame or {}
+        try:
+            return self._generate_internal(
+                video_path,
+                all_rallies,
+                scored_rallies,
+                events,
+                intelligence,
+                max_ball_speed,
+                target_id,
+            )
+        except Exception as exc:
+            logger.error("CoachHighlightEngine failed: %s", exc, exc_info=True)
+            return {
+                "manifest": [],
+                "by_category": {},
+                "paths": [],
+                "events": [],
+                "error": str(exc),
+            }
+
+    def _generate_internal(
+        self,
+        video_path: str,
+        all_rallies: list[RallySegment],
+        scored_rallies: list[RallySegment],
+        events: list[MatchEvent],
+        intelligence: dict[str, Any],
+        max_ball_speed: float,
+        target_id: int | None,
+    ) -> dict[str, Any]:
 
         shots = intelligence.get("shot_understanding", [])
         rally_graphs = intelligence.get("rally_graphs", [])
@@ -129,32 +179,39 @@ class CoachHighlightEngine:
 
         highlights: list[CoachingHighlight] = []
         highlights.extend(self._from_rallies(all_rallies, scored_rallies, events, rally_graphs, max_ball_speed))
-        highlights.extend(self._from_shots(shots, rally_graphs, target_id))
+        highlights.extend(self._from_shots(shots, rally_graphs, target_id, all_rallies))
         highlights.extend(self._from_events(events, all_rallies))
         highlights.extend(self._from_recommendations(recommendations))
         highlights.extend(self._from_patterns(patterns, shots, rally_graphs))
         highlights.extend(self._story_highlights(highlights, scored_rallies))
 
-        # Deduplicate overlapping same-level clips in same category (keep higher excitement)
+        highlights = self._filter_quality(highlights, all_rallies, scored_rallies)
         highlights = self._dedupe(highlights)
+        highlights = self._cap_defense_per_point(highlights, all_rallies)
+        highlights = self._assign_longest_rally(highlights)
         highlights.sort(key=lambda h: h.excitement, reverse=True)
 
         # Assign top_moments
         for i, h in enumerate(highlights[: self.top_moments]):
             if "top_moments" not in h.categories:
                 h.categories.append("top_moments")
-            if i == 0 and h.level == HighlightLevel.RALLY.value and "longest_rally" not in h.categories:
-                h.categories.append("longest_rally")
 
         by_category: dict[str, list[CoachingHighlight]] = {k: [] for k in CATEGORY_LABELS}
         for h in highlights:
             for cat in h.categories:
-                if cat in by_category and len(by_category[cat]) < self.max_per_category:
+                if cat not in by_category:
+                    continue
+                cap = self.category_caps.get(cat, self.max_per_category)
+                if len(by_category[cat]) < cap:
                     by_category[cat].append(h)
 
         paths: list[str] = []
         if video_path and Path(video_path).exists():
             paths = self._extract_clips(video_path, by_category)
+            # Generate annotated versions of all top clips
+            if self.annotate and self.frame_annotations:
+                annotated_paths = self._annotate_clips(video_path, highlights[:self.top_moments])
+                paths.extend(annotated_paths)
 
         manifest = [h.to_dict() for h in highlights]
         manifest_path = self.output_dir / "manifest.json"
@@ -195,7 +252,7 @@ class CoachHighlightEngine:
         out: list[CoachingHighlight] = []
         graph_by_range = {(g["start_frame"], g["end_frame"]): g for g in rally_graphs}
 
-        pool = scored if scored else sorted(all_rallies, key=lambda r: r.excitement_score, reverse=True)[:5]
+        pool = scored if scored else sorted(all_rallies, key=lambda r: r.excitement_score, reverse=True)
         if not pool and rally_graphs:
             for g in rally_graphs:
                 pool.append(
@@ -208,6 +265,15 @@ class CoachHighlightEngine:
                 )
 
         for r in pool:
+            core_duration_s = (r.end_frame - r.start_frame) / self.fps
+            if core_duration_s > self.max_rally_highlight_s:
+                logger.warning(
+                    "Skipping mega-rally highlight (%.1fs > %.1fs cap)",
+                    core_duration_s,
+                    self.max_rally_highlight_s,
+                )
+                continue
+
             rally_events = [e for e in events if r.start_frame <= e.frame_idx <= r.end_frame]
             graph = graph_by_range.get((r.start_frame, r.end_frame))
             if not graph:
@@ -225,7 +291,6 @@ class CoachHighlightEngine:
             tags: list[str] = []
             if r.rally_length_shots >= 10:
                 tags.append("Long Rally")
-                categories.append("longest_rally")
             if wall_count >= 2 or any(e.event_type == EventType.WALL_EXCHANGE for e in rally_events):
                 categories.append("wall_play")
                 tags.append("Wall Play")
@@ -236,11 +301,36 @@ class CoachHighlightEngine:
                 tags.append("Winner")
 
             difficulty = min(100.0, r.rally_length_shots * 4 + wall_count * 8 + net_count * 5)
-            excitement = float(r.excitement_score or min(100.0, difficulty + max_ball_speed / 5))
+
+            # Improved excitement scoring:
+            # Base: existing excitement score (already factors in rally length + speed)
+            # Bonus: wall/glass play is KEY in padel (unique to the sport)
+            # Bonus: net dominance battles are crowd pleasers
+            # Bonus: peak ball speed in the rally (not just max over whole match)
+            has_winner = any(e.event_type in (EventType.SMASH_WINNER, EventType.WINNER) for e in rally_events)
+            glass_hit_count = sum(
+                1 for n in nodes
+                if n.get("type") == "wall_hit" and "glass" in str(n.get("hit_type", "")).lower()
+            )
+            rally_peak_speed = peak_speed_in_range(
+                self.ball_speeds_by_frame, r.start_frame, r.end_frame
+            )
+            if rally_peak_speed <= 0:
+                rally_peak_speed = max_ball_speed * 0.5
+            base_exc = float(r.excitement_score or 40.0)
+            wall_bonus = min(30.0, wall_count * 7.0)
+            glass_bonus = min(15.0, glass_hit_count * 8.0)
+            net_bonus = min(15.0, net_count * 5.0)
+            winner_bonus = 20.0 if has_winner else 0.0
+            speed_bonus = min(15.0, rally_peak_speed / 12.0)
+            length_bonus = min(10.0, max(0.0, (r.rally_length_shots - 5) * 1.5))
+            excitement = min(100.0, base_exc + wall_bonus + glass_bonus + net_bonus + winner_bonus + speed_bonus + length_bonus)
 
             start_f = max(0, r.start_frame - self.rally_preroll)
             end_f = r.end_frame + self.rally_postroll
             start_s = start_f / self.fps
+            duration_s = (r.end_frame - r.start_frame) / self.fps
+            point_idx = self._point_index(all_rallies, r)
 
             out.append(
                 CoachingHighlight(
@@ -257,33 +347,50 @@ class CoachHighlightEngine:
                     categories=categories,
                     primary_category="best_rallies",
                     chain=chain,
-                    commentary=self._commentary_rally(r, chain, tags, wall_count, net_count),
+                    commentary=self._commentary_rally(
+                        r, chain, tags, wall_count, net_count, point_idx, duration_s
+                    ),
                     overlay={
                         "pressure": "high" if net_count >= 2 else "medium",
                         "win_probability": min(0.95, 0.4 + excitement / 200),
-                        "ball_speed_kmh": round(max_ball_speed, 1),
+                        "ball_speed_kmh": round(rally_peak_speed, 1),
+                        "point_number": point_idx,
                     },
                     confidence=0.82,
-                    tags=tags,
+                    tags=tags + [f"Point {point_idx}"],
                 )
             )
         return out
+
+    @staticmethod
+    def _point_index(rallies: list[RallySegment], rally: RallySegment) -> int:
+        ordered = sorted(rallies, key=lambda r: r.start_frame)
+        for i, r in enumerate(ordered, start=1):
+            if r.start_frame == rally.start_frame and r.end_frame == rally.end_frame:
+                return i
+        return 1
 
     def _from_shots(
         self,
         shots: list[dict],
         rally_graphs: list[dict],
         target_id: int | None,
+        all_rallies: list[RallySegment],
     ) -> list[CoachingHighlight]:
         out: list[CoachingHighlight] = []
         for s in shots:
             stroke = s.get("stroke", "")
+            intent = s.get("intent", "neutral")
             cat = _stroke_category(stroke)
-            if not cat and s.get("intent") not in ("finishing", "attack"):
-                if s.get("intent") != "defensive" or stroke not in ("lob", "salida", "drop_shot"):
+            if stroke == "drop_shot" and intent in ("recovery", "defensive"):
+                cat = "best_defense"
+            if not cat and intent not in ("finishing", "attack"):
+                if intent != "defensive" or stroke not in ("lob", "salida"):
                     continue
 
             frame = int(s.get("frame", 0))
+            if not any(r.start_frame <= frame <= r.end_frame for r in all_rallies):
+                continue
             speed = float(s.get("speed_kmh", 0))
             epv = float(s.get("epv_delta", 0))
             decision = s.get("decision_quality", s.get("decision", "neutral"))
@@ -337,6 +444,7 @@ class CoachHighlightEngine:
         return out
 
     def _from_events(self, events: list[MatchEvent], rallies: list[RallySegment]) -> list[CoachingHighlight]:
+        """Only emit highlights for decisive match events — not raw net approach spam."""
         out: list[CoachingHighlight] = []
         for e in events:
             cat = None
@@ -344,10 +452,13 @@ class CoachHighlightEngine:
                 cat = "best_smashes"
             elif e.event_type == EventType.WALL_WINNER:
                 cat = "wall_play"
-            elif e.event_type == EventType.NET_APPROACH:
-                cat = "net_battle"
             elif e.event_type in (EventType.UNFORCED_ERROR, EventType.FORCED_ERROR):
                 cat = "biggest_mistake"
+            elif e.event_type == EventType.WINNER:
+                cat = "top_moments"
+            elif e.event_type == EventType.WALL_EXCHANGE:
+                cat = "wall_play"
+            # LONG_RALLY / NET_APPROACH — stats only, no standalone clip (use full point replay)
             if not cat:
                 continue
 
@@ -355,11 +466,16 @@ class CoachHighlightEngine:
             start_f = max(0, frame - self.shot_preroll)
             end_f = frame + self.shot_postroll
             rally_len = 0
+            matched_rally = None
             for r in rallies:
                 if r.start_frame <= frame <= r.end_frame:
                     rally_len = r.rally_length_shots
+                    matched_rally = r
                     break
+            if not matched_rally:
+                continue
 
+            label = e.event_type.value.replace("_", " ")
             out.append(
                 CoachingHighlight(
                     event_id=self._new_id(),
@@ -370,11 +486,15 @@ class CoachHighlightEngine:
                     end_time=_fmt_time(end_f / self.fps),
                     time_s=round(frame / self.fps, 2),
                     rally_length=rally_len,
-                    excitement=75.0,
-                    categories=[cat],
-                    primary_category=cat,
-                    commentary=f"Match event: {e.event_type.value.replace('_', ' ')} at {_fmt_time(frame / self.fps)}.",
-                    confidence=0.7,
+                    excitement=78.0,
+                    categories=[cat if cat in CATEGORY_LABELS else "top_moments"],
+                    primary_category=cat if cat in CATEGORY_LABELS else "top_moments",
+                    commentary=(
+                        f"Point {self._point_index(rallies, matched_rally)} — "
+                        f"{label} at {_fmt_time(frame / self.fps)} "
+                        f"({rally_len} shots in rally)."
+                    ),
+                    confidence=0.75,
                     tags=[e.event_type.value],
                 )
             )
@@ -495,21 +615,109 @@ class CoachHighlightEngine:
         tags: list[str],
         wall_count: int,
         net_count: int,
+        point_idx: int = 1,
+        duration_s: float = 0.0,
     ) -> str:
-        parts: list[str] = []
+        parts: list[str] = [f"Point {point_idx}"]
         if rally.rally_length_shots:
-            parts.append(f"This rally lasted {rally.rally_length_shots} shots.")
+            dur = duration_s or (rally.end_frame - rally.start_frame) / self.fps
+            parts.append(f"— {rally.rally_length_shots}-shot rally lasting {dur:.1f}s.")
         if wall_count >= 2:
             parts.append(
-                f"The turning point involved {wall_count} wall interactions — classic padel tempo before the finish."
+                f"Wall play featured {wall_count} interactions before the finish."
             )
         if net_count >= 2:
-            parts.append("Both teams traded at the net, increasing pressure through volleys and quick reactions.")
+            parts.append("Both pairs traded at the net under pressure.")
         if chain and chain != "empty":
-            parts.append(f"Shot sequence: {chain}.")
-        if tags:
-            parts.append(f"Tags: {', '.join(tags)}.")
-        return " ".join(parts) if parts else "Full rally replay for tactical review."
+            parts.append(f"Sequence: {chain}.")
+        elif tags:
+            parts.append(f"Highlights: {', '.join(tags)}.")
+        return " ".join(parts) if len(parts) > 1 else f"Point {point_idx} — full rally replay for tactical review."
+
+    def _filter_quality(
+        self,
+        highlights: list[CoachingHighlight],
+        all_rallies: list[RallySegment],
+        scored_rallies: list[RallySegment],
+    ) -> list[CoachingHighlight]:
+        """Drop vague, unanchored highlights that aren't tied to detected points."""
+        if not all_rallies:
+            return highlights
+
+        rally_pool = scored_rallies or all_rallies
+        kept: list[CoachingHighlight] = []
+        for h in highlights:
+            if h.level == HighlightLevel.RALLY.value:
+                kept.append(h)
+                continue
+            if h.level == HighlightLevel.STORY.value:
+                kept.append(h)
+                continue
+            if h.level == HighlightLevel.TACTICAL.value and h.categories == ["coaching_moments"]:
+                kept.append(h)
+                continue
+
+            in_point = any(r.start_frame <= h.start_frame <= r.end_frame + self.rally_postroll for r in rally_pool)
+            if not in_point:
+                continue
+            if h.excitement < self.min_excitement and h.level == HighlightLevel.SHOT.value:
+                continue
+            if "net_battle" in h.categories and h.level == HighlightLevel.SHOT.value:
+                continue
+            if "longest_rally" in h.categories and h.level != HighlightLevel.RALLY.value:
+                continue
+            kept.append(h)
+        return kept
+
+    def _assign_longest_rally(self, highlights: list[CoachingHighlight]) -> list[CoachingHighlight]:
+        """Tag exactly one full point replay as longest_rally — never a 6s shot snippet."""
+        for h in highlights:
+            if "longest_rally" in h.categories:
+                h.categories = [c for c in h.categories if c != "longest_rally"]
+
+        rally_hls = [h for h in highlights if h.level == HighlightLevel.RALLY.value]
+        if not rally_hls:
+            return highlights
+
+        longest = max(
+            rally_hls,
+            key=lambda h: (h.rally_length, h.end_frame - h.start_frame),
+        )
+        longest.categories.append("longest_rally")
+        return highlights
+
+    def _cap_defense_per_point(
+        self,
+        highlights: list[CoachingHighlight],
+        all_rallies: list[RallySegment],
+    ) -> list[CoachingHighlight]:
+        """Keep salida/lob always; max one drop_shot defense clip per point."""
+        defense = [
+            h for h in highlights
+            if "best_defense" in h.categories and h.level == HighlightLevel.SHOT.value
+        ]
+        if not defense:
+            return highlights
+
+        others = [h for h in highlights if h not in defense]
+        by_point: dict[int, list[CoachingHighlight]] = {}
+        for h in defense:
+            pt = 0
+            for r in all_rallies:
+                if r.start_frame <= h.start_frame <= r.end_frame:
+                    pt = self._point_index(all_rallies, r)
+                    break
+            by_point.setdefault(pt, []).append(h)
+
+        kept: list[CoachingHighlight] = []
+        for items in by_point.values():
+            wall = [h for h in items if h.stroke in ("salida", "lob")]
+            drops = [h for h in items if h.stroke == "drop_shot"]
+            kept.extend(wall)
+            if drops:
+                kept.append(max(drops, key=lambda h: (h.excitement, h.overlay.get("ball_speed_kmh", 0))))
+
+        return others + kept
 
     def _commentary_shot(self, shot: dict, rally_graphs: list[dict]) -> str:
         stroke = shot.get("stroke", "shot").replace("_", " ")
@@ -518,7 +726,8 @@ class CoachHighlightEngine:
         speed = shot.get("speed_kmh", 0)
         decision = shot.get("decision_quality", shot.get("decision", "neutral"))
         parts = [
-            f"{stroke.title()} from the {region} with {intent} intent at {speed:.0f} km/h.",
+            f"At {_fmt_time(shot.get('frame', 0) / self.fps)} — "
+            f"{stroke.title()} from the {region} ({intent} intent, {speed:.0f} km/h).",
         ]
         if decision in ("good", "excellent"):
             parts.append("The decision quality was strong given player positions and pressure.")
@@ -536,6 +745,12 @@ class CoachHighlightEngine:
             for prev in seen:
                 if prev.level != h.level:
                     continue
+                # Keep one highlight per point even when preroll/postroll overlaps adjacent points
+                if h.level == HighlightLevel.RALLY.value:
+                    p_prev = prev.overlay.get("point_number")
+                    p_h = h.overlay.get("point_number")
+                    if p_prev and p_h and p_prev != p_h:
+                        continue
                 if prev.start_frame <= h.end_frame and h.start_frame <= prev.end_frame:
                     if set(prev.categories) & set(h.categories):
                         overlap = True
@@ -561,6 +776,75 @@ class CoachHighlightEngine:
                         extracted.add(key)
                         paths.append(str(out))
                 h.clip_path = rel_name.replace("\\", "/")
+
+        return paths
+
+    def _annotate_clips(
+        self,
+        video_path: str,
+        highlights: list[CoachingHighlight],
+    ) -> list[str]:
+        """
+        Generate broadcast-style annotated versions of top highlight clips.
+        Each annotated clip has:
+          - ball trajectory trail
+          - player bounding boxes + team labels
+          - mini court diagram
+          - speed meter + excitement bar
+        """
+        AnnotatedExporter, _ = _get_annotated_exporter()
+        if AnnotatedExporter is None:
+            logger.warning("AnnotatedExporter unavailable; skipping annotated clips")
+            return []
+
+        ann_dir = self.output_dir / "annotated"
+        ann_dir.mkdir(parents=True, exist_ok=True)
+        paths: list[str] = []
+
+        try:
+            exporter = AnnotatedExporter(self.config, fps=self.fps)
+        except Exception as exc:
+            logger.warning("Failed to init AnnotatedExporter: %s", exc)
+            return []
+
+        seen: set[tuple[int, int]] = set()
+        for i, h in enumerate(highlights):
+            key = (h.start_frame, h.end_frame)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            out_name = f"top_{i:02d}_{h.primary_category}{self._ann_suffix}.mp4"
+            out_path = ann_dir / out_name
+
+            # Build per-frame annotation slice for this clip
+            clip_frames = {
+                f: ann
+                for f, ann in self.frame_annotations.items()
+                if h.start_frame <= f <= h.end_frame
+            }
+
+            # Update excitement level in annotations for this specific highlight
+            for ann in clip_frames.values():
+                ann.excitement = h.excitement
+                ann.rally_length = h.rally_length
+                ann.state = h.primary_category.replace("_", " ").upper()
+
+            try:
+                result = exporter.export(
+                    video_path=video_path,
+                    out_path=out_path,
+                    frame_data=clip_frames,
+                    highlight=h,
+                    start_frame=h.start_frame,
+                    end_frame=h.end_frame,
+                )
+                if result:
+                    h.clip_path = str(Path(result).relative_to(self.output_dir.parent))
+                    paths.append(result)
+                    logger.info("Annotated clip → %s", out_name)
+            except Exception as exc:
+                logger.warning("Annotated clip failed for %s: %s", out_name, exc)
 
         return paths
 

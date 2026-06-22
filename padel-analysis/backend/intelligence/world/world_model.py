@@ -9,9 +9,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from backend.intelligence.confidence.propagation import ConfidenceTracker, ModuleConfidence
-from backend.intelligence.court.semantic_regions import SemanticRegion, classify_region
 from backend.intelligence.domain import MatchState
+from backend.intelligence.court.semantic_regions import SemanticRegion, classify_region
+from backend.intelligence.confidence.propagation import ConfidenceTracker, ModuleConfidence
 from backend.intelligence.geometry.entities import GeometryFrame
 from backend.intelligence.interaction.graph import InteractionNode
 from backend.intelligence.match_state.engine import MatchStateEngine
@@ -146,6 +146,21 @@ class WorldModel:
         self._rally_id = 0
         self._frame_in_rally = 0
         self._prev_state = MatchState.IDLE
+        self._idle_since_rally = 0
+        self._current_stint_dwell = 0
+        self._rally_stint_counted = False
+        rcfg = config.get("rally", {})
+        self._min_rally_dwell_frames = max(1, int(rcfg.get("fsm_min_dwell_s", 1.5) * self.fps))
+        self._min_rally_gap_frames = int(rcfg.get("point_gap_s", 5.0) * self.fps)
+        self._active_rally_states = frozenset(
+            {
+                MatchState.RALLY,
+                MatchState.NET_ATTACK,
+                MatchState.WALL_EXCHANGE,
+                MatchState.LOB_DEFENSE,
+                MatchState.RETURN,
+            }
+        )
 
     @property
     def current(self) -> WorldSnapshot | None:
@@ -206,13 +221,23 @@ class WorldModel:
             wall_hit,
             ball_bounce,
         )
-        if match_state == MatchState.RALLY and self._prev_state != MatchState.RALLY:
-            self._rally_id += 1
-            self._frame_in_rally = 0
-        elif match_state in (MatchState.RALLY, MatchState.NET_ATTACK, MatchState.WALL_EXCHANGE):
+        if match_state in self._active_rally_states:
+            entering = self._prev_state not in self._active_rally_states
+            if entering:
+                self._current_stint_dwell = 0
+                self._rally_stint_counted = False
+            self._current_stint_dwell += 1
+            # Only count a rally after ~1.5s continuous active play (kills FSM flicker inflation)
+            if not self._rally_stint_counted and self._current_stint_dwell >= self._min_rally_dwell_frames:
+                self._rally_id += 1
+                self._rally_stint_counted = True
             self._frame_in_rally += 1
+            self._idle_since_rally = 0
         else:
+            self._current_stint_dwell = 0
+            self._rally_stint_counted = False
             self._frame_in_rally = 0
+            self._idle_since_rally += 1
         self._prev_state = match_state
 
         possession = stroke.player_id if stroke else None

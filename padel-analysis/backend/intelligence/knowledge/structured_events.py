@@ -73,7 +73,7 @@ class KnowledgeEngine:
         target_id: int,
         match_meta: dict,
     ) -> dict[str, Any]:
-        shot_facts = [s.to_dict() for s in shots if s.player_id == target_id]
+        shot_facts = [s.to_dict() for s in shots]
         return {
             "match": match_meta,
             "world_summary": world.summary(),

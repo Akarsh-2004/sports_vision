@@ -13,6 +13,9 @@ from backend.analytics.contact.shot_gating import ShotDebouncer
 from backend.analytics.events.active_play import ActivePlayGate
 from backend.analytics.events.event_detector import EventDetector
 from backend.analytics.events.point_segmentation import PointSegmentation
+from backend.analytics.events.point_end_detector import PointEndDetector
+from backend.analytics.events.serve_detector import ServeDetector
+from backend.analytics.events.score_tracker import ScoreTracker, PointResult
 from backend.analytics.events.rally_gating import players_in_ready_position, walking_to_baseline
 from backend.analytics.events.wall_detector import WallDetector
 from backend.analytics.movement.movement_analytics import MovementAnalytics
@@ -51,7 +54,8 @@ from backend.tracking.player_tracker import PlayerTracker
 from backend.utils.audio_rally import detect_hit_frames
 from backend.utils.config import load_config
 from backend.utils.logging import get_logger
-from backend.utils.types import MatchStats, StrokeEvent, StrokeType
+from backend.utils.speed import clamp_ball_speed_kmh
+from backend.utils.types import MatchStats, RallySegment, StrokeEvent, StrokeType
 from backend.visualization.charts import VisualizationEngine
 
 logger = get_logger(__name__)
@@ -139,6 +143,8 @@ class PipelineOrchestrator:
         match_id = Path(video_path).stem + "_" + uuid.uuid4().hex[:8]
         reports_dir = Path(self.config["paths"]["data_reports"]) / match_id
         reports_dir.mkdir(parents=True, exist_ok=True)
+        self.highlights.set_output_dir(reports_dir / "highlights")
+        self._speed_cap = self.config.get("ball", {}).get("max_speed_kmh", 120.0)
 
         self.config["pipeline"]["output_dir"] = str(Path(self.config["paths"]["data_processed"]) / match_id)
         _stage(1, 0.0)
@@ -169,8 +175,10 @@ class PipelineOrchestrator:
         stroke_events: list[StrokeEvent] = []
         shot_frames: list[int] = []
         ball_trajectory_court: list[tuple[int, float, float]] = []
+        ball_trajectory_px: list[tuple[int, float, float, float]] = []  # (frame, x_px, y_px, conf)
         ground_bounces: set[int] = set()
         max_ball_speed = 0.0
+        ball_speeds_by_frame: dict[int, float] = {}
         target_id: int | None = None
         prev_court_pos = None
         prev_player_positions: dict[int, tuple[float, float]] = {}
@@ -179,6 +187,8 @@ class PipelineOrchestrator:
         frame_idx = -1
         last_ball_visible = False
         last_wall_hit_frame = False
+        # Per-frame player pixel boxes for annotated export: {frame: {track_id: (x1,y1,x2,y2,team)}}
+        player_pixel_boxes: dict[int, dict[int, tuple]] = {}
 
         _stage(2, 5.0)
         for frame_idx, frame in self.ingestion.frame_generator(playable_path):
@@ -218,7 +228,8 @@ class PipelineOrchestrator:
 
             ball_det = self.ball_detector.detect(frame)
             bx, by, bconf = ball_tracker.update(frame_idx, ball_det)
-            ball_speed = ball_tracker.get_speed_kmh()
+            ball_speed = clamp_ball_speed_kmh(ball_tracker.get_speed_kmh(), self._speed_cap)
+            ball_speeds_by_frame[frame_idx] = ball_speed
             max_ball_speed = max(max_ball_speed, ball_speed)
             ball_bounce = self.ball_detector.detect_bounce(ball_speed)
 
@@ -234,6 +245,20 @@ class PipelineOrchestrator:
                 if court_ball:
                     ball_trajectory_court.append((frame_idx, court_ball[0], court_ball[1]))
                     ball_court_positions[frame_idx] = court_ball
+
+            # Store pixel-space ball positions for annotated export
+            if bconf > 0.10:
+                ball_trajectory_px.append((frame_idx, bx, by, bconf))
+
+            # Store player pixel boxes for annotated export (stride-aligned)
+            if run_detection and players:
+                player_pixel_boxes[frame_idx] = {
+                    p.track_id: (
+                        p.bbox.x1, p.bbox.y1, p.bbox.x2, p.bbox.y2,
+                        getattr(p, 'team', p.track_id % 2),
+                    )
+                    for p in players
+                }
 
             ready = players_in_ready_position(players, court_state, self.court_length)
             walking = walking_to_baseline(players, prev_player_positions, self.fps)
@@ -385,14 +410,14 @@ class PipelineOrchestrator:
 
                 shot_understanding = None
                 frame_interactions: list = []
-                if stroke_obs and target_id is not None:
-                    tp = next((p for p in geo.players if p.track_id == target_id), None)
-                    if tp:
-                        region = classify_region(tp.position[0], tp.position[1])
-                        intent = infer_shot_intent(stroke_obs.stroke_type, geo, target_id)
-                        at_net = tp.zone.value == "net"
+                if stroke_obs and hitter_id is not None:
+                    hp = next((p for p in geo.players if p.track_id == hitter_id), None)
+                    if hp:
+                        region = classify_region(hp.position[0], hp.position[1])
+                        intent = infer_shot_intent(stroke_obs.stroke_type, geo, hitter_id)
+                        at_net = hp.zone.value == "net"
                         epv_before, epv_after = estimate_epv(
-                            tp.position[1],
+                            hp.position[1],
                             stroke_obs.stroke_type,
                             intent,
                             ball_speed,
@@ -400,18 +425,18 @@ class PipelineOrchestrator:
                             opponents_deep=True,
                         )
                         dq, note = evaluate_decision(
-                            stroke_obs.stroke_type, geo, target_id, ball_speed
+                            stroke_obs.stroke_type, geo, hitter_id, ball_speed
                         )
                         shot_understanding = ShotUnderstanding(
                             frame_idx=frame_idx,
-                            player_id=target_id,
+                            player_id=hitter_id,
                             stroke=stroke_obs.stroke_type,
                             intent=intent,
-                            pressure=infer_pressure(tp.position[1], ball_speed, at_net),
+                            pressure=infer_pressure(hp.position[1], ball_speed, at_net),
                             risk=infer_risk(stroke_obs.stroke_type, region),
                             expected_outcome=infer_expected_outcome(stroke_obs.stroke_type, intent),
                             region=region,
-                            position=tp.position,
+                            position=hp.position,
                             speed_kmh=ball_speed,
                             confidence=conf.stroke,
                             decision_quality=dq,
@@ -452,8 +477,63 @@ class PipelineOrchestrator:
         total_analyzed = frame_idx + 1
 
         movement_stats = self.movement.compute()
-        rallies = self.points.segment(shot_frames)
-        all_rallies = list(rallies)
+        ball_rallies = self.points.segment(shot_frames)
+        raw_rallies = self.points.best_segments(
+            shot_frames, ball_rallies, active_segments=active_segments
+        )
+
+        point_end_detector = PointEndDetector(self.config, self.court_length, self.court_width)
+        serve_detector = ServeDetector(self.config, self.court_length)
+        score_tracker = ScoreTracker()
+        frame_index = point_end_detector.build_frame_index(
+            self.points._frames,
+            ball_court_positions,
+            player_court_positions,
+        )
+
+        completed_rallies: list[RallySegment] = []
+        for i, rally in enumerate(raw_rallies):
+            dead_end = serve_detector.dead_gap_before(rally, active_segments)
+            serve_frame = serve_detector.detect(rally, frame_index, dead_end)
+            end_reason = point_end_detector.classify_end(rally, frame_index)
+            winner = (
+                PointEndDetector.infer_winner(rally, frame_index, self.court_length)
+                if end_reason == "point_complete"
+                else None
+            )
+            duration_s = (rally.end_frame - rally.start_frame) / self.fps
+            score_tracker.add_point(
+                PointResult(
+                    rally_id=i,
+                    start_frame=serve_frame or rally.start_frame,
+                    end_frame=rally.end_frame,
+                    serve_frame=serve_frame,
+                    end_reason=end_reason,
+                    winner_side=winner,
+                    shot_count=rally.rally_length_shots,
+                    duration_s=round(duration_s, 2),
+                )
+            )
+            if end_reason == "point_complete":
+                completed_rallies.append(
+                    RallySegment(
+                        start_frame=serve_frame or rally.start_frame,
+                        end_frame=rally.end_frame,
+                        rally_length_shots=rally.rally_length_shots,
+                        wall_hits=rally.wall_hits,
+                        excitement_score=getattr(rally, "excitement_score", 0.0),
+                    )
+                )
+
+        all_rallies = completed_rallies if completed_rallies else raw_rallies
+        score_summary = score_tracker.summary()
+
+        logger.info(
+            "Point segmentation: %d raw, %d complete (score %s)",
+            len(raw_rallies),
+            score_summary["points_complete"],
+            score_summary["score"],
+        )
         for r in all_rallies:
             rally_events = [e for e in self.events.events if r.start_frame <= e.frame_idx <= r.end_frame]
             r.excitement_score = float(
@@ -478,6 +558,20 @@ class PipelineOrchestrator:
         )
 
         intelligence_output: dict = {}
+        from collections import Counter
+
+        shot_counts = Counter(s.player_id for s in self.shot_understandings)
+        if shot_counts:
+            best_id, best_n = shot_counts.most_common(1)[0]
+            if best_n > 0 and (target_id is None or shot_counts.get(target_id, 0) == 0):
+                logger.info(
+                    "Retargeting analysis from player %s to player %s (%d shots)",
+                    target_id,
+                    best_id,
+                    best_n,
+                )
+                target_id = best_id
+
         if self.use_intelligence and target_id is not None:
             intel = IntelligencePipeline(self.config, target_id)
             intelligence_output = intel.finalize(
@@ -515,13 +609,55 @@ class PipelineOrchestrator:
         _stage(18, 93.0)
         stats.summary = intelligence_output.get("coach_report") or self.reporter.generate(stats)
         _stage(19, 96.0)
-        viz_paths = self.viz.render_all(stats, self.quality.shots)
+        self.viz.output_dir = reports_dir / "viz"
+        viz_paths = self.viz.render_all(
+            stats,
+            self.quality.shots,
+            shot_understanding=intelligence_output.get("shot_understanding", []),
+            all_rallies=all_rallies,
+        )
         clip_paths: list[str] = []
         coach_highlights: dict = {}
         try:
             from backend.highlights.coach_highlights import CoachHighlightEngine
 
             coach_engine = CoachHighlightEngine(self.config, reports_dir)
+
+            # Build broadcast-quality frame annotations for annotated clip export
+            try:
+                from backend.visualization.annotated_exporter import (
+                    AnnotatedExporter, FrameAnnotation, PlayerAnnotation, build_frame_annotations
+                )
+                frame_anns = build_frame_annotations(
+                    player_court_positions,
+                    ball_court_positions,
+                    ball_trajectory_px,
+                    all_rallies,
+                    self.fps,
+                )
+                # Enrich with pixel-space player boxes
+                for fidx, boxes in player_pixel_boxes.items():
+                    if fidx in frame_anns:
+                        fa = frame_anns[fidx]
+                        fa.players = [
+                            PlayerAnnotation(
+                                track_id=tid,
+                                team=int(v[4]),
+                                x1=v[0], y1=v[1], x2=v[2], y2=v[3],
+                                court_x=(
+                                    player_court_positions.get(fidx, {}).get(tid, (None, None))[0]
+                                ),
+                                court_y=(
+                                    player_court_positions.get(fidx, {}).get(tid, (None, None))[1]
+                                ),
+                                label=f"P{tid}",
+                            )
+                            for tid, v in boxes.items()
+                        ]
+                coach_engine.frame_annotations = frame_anns
+            except Exception as fa_exc:
+                logger.warning("Frame annotation build failed (non-fatal): %s", fa_exc)
+
             coach_highlights = coach_engine.generate(
                 playable_path,
                 all_rallies,
@@ -530,14 +666,22 @@ class PipelineOrchestrator:
                 intelligence_output,
                 max_ball_speed,
                 target_id,
+                ball_speeds_by_frame=ball_speeds_by_frame,
             )
             clip_paths = coach_highlights.get("paths", [])
+            if coach_highlights.get("error"):
+                logger.warning("Coach highlights error: %s", coach_highlights["error"])
             if not clip_paths:
+                logger.warning(
+                    "No highlight clips extracted (%d rallies, coach enabled=%s)",
+                    len(all_rallies),
+                    self.config.get("coach_highlights", {}).get("enabled", True),
+                )
                 clip_paths = self.highlights.extract_clips(playable_path, rallies)
         except FileNotFoundError as exc:
             logger.warning("Highlight extraction skipped: %s", exc)
         except Exception as exc:
-            logger.warning("Coach highlights failed, falling back to legacy: %s", exc)
+            logger.warning("Coach highlights failed, falling back to legacy: %s", exc, exc_info=True)
             try:
                 clip_paths = self.highlights.extract_clips(playable_path, rallies)
             except FileNotFoundError:
@@ -563,6 +707,15 @@ class PipelineOrchestrator:
                 }
                 for r in all_rallies
             ],
+            "rallies_raw": [
+                {
+                    "start_frame": r.start_frame,
+                    "end_frame": r.end_frame,
+                    "rally_length_shots": r.rally_length_shots,
+                }
+                for r in raw_rallies
+            ],
+            "score": score_summary,
             "ball_shot_frames": ball_shot_frames,
             "shot_frames": shot_frames,
             "summary_md": stats.summary,
@@ -579,6 +732,16 @@ class PipelineOrchestrator:
             (reports_dir / "training_report.md").write_text(
                 intelligence_output["reports"].get("training", ""), encoding="utf-8"
             )
+            per_player = intelligence_output["reports"].get("per_player", {})
+            if per_player:
+                players_dir = reports_dir / "players"
+                players_dir.mkdir(parents=True, exist_ok=True)
+                index_lines = ["# Player Reports", ""]
+                for pid, text in sorted(per_player.items(), key=lambda x: int(x[0])):
+                    path = players_dir / f"player_{pid}.md"
+                    path.write_text(text, encoding="utf-8")
+                    index_lines.append(f"- [Player {pid}](player_{pid}.md)")
+                (players_dir / "index.md").write_text("\n".join(index_lines) + "\n", encoding="utf-8")
         (reports_dir / "full_output.json").write_text(
             json.dumps({**output, "source_video": video_path, "playable_video": playable_path, "analysis_fps": self.fps}, indent=2),
             encoding="utf-8",

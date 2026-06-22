@@ -23,9 +23,33 @@ class CourtDetector:
         self.court_length = court_cfg["court_length_m"]
         self.court_width = court_cfg["court_width_m"]
         self.use_calibration = court_cfg.get("use_manual_calibration", True)
+        self.use_yolo_court = court_cfg.get("use_yolo_court", True)
+        self.yolo_court_weights = court_cfg.get("yolo_court_weights", "weights/court_keypoints_yolov8.pt")
+        self.yolo_court_conf = court_cfg.get("yolo_court_conf", 0.25)
         self.video_stem: str | None = None
         self._cached_h: np.ndarray | None = None
         self._ema_alpha = 0.3
+        self._yolo_detector = None
+        if self.use_yolo_court:
+            self._init_yolo_detector(config)
+
+    def _init_yolo_detector(self, config: dict) -> None:
+        from pathlib import Path
+
+        weights = Path(self.yolo_court_weights)
+        if not weights.is_absolute():
+            root = Path(__file__).resolve().parents[2]
+            weights = root / weights
+        if not weights.exists():
+            logger.info("YOLO court weights not found at %s; using classical detection", weights)
+            return
+        try:
+            from backend.court.yolo_court_detector import YoloCourtKeypointDetector
+
+            device = config.get("models", {}).get("device", "auto")
+            self._yolo_detector = YoloCourtKeypointDetector(weights, conf=self.yolo_court_conf, device=device)
+        except Exception as exc:
+            logger.warning("YOLO court detector unavailable: %s", exc)
 
     def set_video_source(self, video_path: str) -> None:
         from pathlib import Path
@@ -48,8 +72,14 @@ class CourtDetector:
                 valid_for_analytics=True,
             )
 
-        keypoints = self._detect_white_line_keypoints(frame)
-        h_mat, conf = self._homography_from_keypoints(keypoints)
+        h_mat, conf = None, 0.0
+        line_keypoints: list[tuple[float, float]] = []
+        if self._yolo_detector is not None:
+            h_mat, conf = self._yolo_detector.homography_from_frame(frame)
+
+        if h_mat is None:
+            line_keypoints = self._detect_white_line_keypoints(frame)
+            h_mat, conf = self._homography_from_keypoints(line_keypoints)
         if h_mat is None:
             lines = self._detect_lines(frame)
             h_mat, conf = self._compute_homography(frame, lines)
@@ -64,7 +94,7 @@ class CourtDetector:
             homography=self._cached_h.tolist() if self._cached_h is not None else None,
             confidence=conf,
             zone=self._infer_zone(self._cached_h),
-            lines_detected=len(keypoints) if keypoints else 0,
+            lines_detected=len(line_keypoints) if line_keypoints else (4 if self._yolo_detector else 0),
             valid_for_analytics=conf >= 0.35 and self._cached_h is not None,
         )
 

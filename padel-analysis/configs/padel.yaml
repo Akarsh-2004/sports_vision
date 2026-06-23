@@ -23,7 +23,7 @@ models:
   # Court keypoints: 'true' uses fine-tuned YOLOv8-pose model
   pose: mediapipe                              # rtmpose | vitpose | mediapipe
   stroke_model: heuristic                      # videomae | slowfast | heuristic
-  device: mps                                 # auto | mps | cuda | cpu
+  device: auto                                 # auto | mps | cuda | cpu
 
 phone:
   enabled: true

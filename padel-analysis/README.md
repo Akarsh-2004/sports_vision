@@ -19,6 +19,10 @@ OpenCV homography is the geometric backbone: every player, ball bounce, and even
 cd padel-analysis
 pip install -r requirements.txt
 
+# Web UI (API + React frontend)
+python run.py serve                    # API on http://localhost:8001
+cd frontend && npm install && npm run dev   # UI on http://localhost:5174
+
 # Phase 1: calibrate court (click 13 landmarks)
 python run.py calibrate path/to/match.mp4
 
@@ -91,3 +95,17 @@ pytest tests/ -v
 3. Replace heuristic ball detector with YOLO + optical flow recovery
 4. Integrate VideoMAE / SlowFast for stroke classification
 5. React dashboard (fork `tennis-analysis/frontend` with padel court SVG)
+
+## Web UI
+
+Minimal React app in `frontend/` — upload a video, track pipeline progress, view point score (A vs B), performance metrics, and coach report.
+
+```bash
+# Terminal 1 — API
+python run.py serve
+
+# Terminal 2 — dev UI (proxies /api → :8001)
+cd frontend && npm install && npm run dev
+```
+
+Production: `cd frontend && npm run build`, then open `http://localhost:8001` (serves built static files).

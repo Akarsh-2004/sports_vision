@@ -17,6 +17,9 @@ AI coaching platform for racket sports — computer vision pipelines plus sports
 cd padel-analysis
 pip install -r requirements.txt
 python run.py run path/to/match.mp4
+
+# Or use the web UI
+python run.py serve
 ```
 
 Outputs land in `padel-analysis/data/reports/<match_id>/` including `dashboard.html`.

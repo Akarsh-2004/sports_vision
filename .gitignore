@@ -32,6 +32,8 @@ tennis-analysis/data/reports/*
 !tennis-analysis/data/reports/.gitkeep
 tennis-analysis/frontend/node_modules/
 tennis-analysis/frontend/dist/
+padel-analysis/frontend/node_modules/
+padel-analysis/frontend/dist/
 
 # Padel analysis artifacts
 padel-analysis/data/raw/*
